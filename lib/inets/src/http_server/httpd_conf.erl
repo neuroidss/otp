@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1997-2015. All Rights Reserved.
+%% Copyright Ericsson AB 1997-2016. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -395,7 +395,8 @@ validate_properties(Properties) ->
 %% That is, if property A depends on property B.
 %% The only sunch preperty at this time is bind_address that depends 
 %% on ipfamily.
-validate_properties2(Properties) ->
+validate_properties2(Properties0) ->
+    Properties = fix_ipfamily(Properties0),
     case proplists:get_value(bind_address, Properties) of
 	undefined ->
 	    case proplists:get_value(sock_type, Properties, ip_comm) of
@@ -420,6 +421,15 @@ validate_properties2(Properties) ->
 			      Address0, IpFamily, Reason}}, 
 		    throw(Error)
 	    end
+    end.
+
+fix_ipfamily(Properties) ->
+    case proplists:get_value(ipfamily, Properties) of
+	undefined ->
+	    Properties;
+	IpFamily ->
+	    NewProps = proplists:delete(ipfamily, Properties),
+	    [{ipfamily, validate_ipfamily(IpFamily)} | NewProps]
     end.
 
 add_inet_defaults(Properties) ->
@@ -1004,7 +1014,8 @@ read_config_file(Stream, SoFar) ->
 	    %% Ignore commented lines for efficiency later ..
 	    read_config_file(Stream, SoFar);
 	Line ->
-	    NewLine = re:replace(clean(Line),"[\t\r\f ]"," ", [{return,list}]),
+	    NewLine = re:replace(white_space_clean(Line),
+				 "[\t\r\f ]"," ", [{return,list}, global]),
 	    case NewLine of
 		[] ->
 		    %% Also ignore empty lines ..
@@ -1020,7 +1031,7 @@ parse_mime_types(Stream,MimeTypesList) ->
 	    eof ->
 		eof;
 	    String ->
-		white_space_clean(String)
+		re:replace(white_space_clean(String), "[\t\r\f ]"," ", [{return,list}, global])	
 	end,
     parse_mime_types(Stream, MimeTypesList, Line).
 parse_mime_types(Stream, MimeTypesList, eof) ->
@@ -1042,6 +1053,8 @@ parse_mime_types(Stream, MimeTypesList, Line) ->
 
 suffixes(_MimeType,[]) ->
     [];
+suffixes(MimeType,[""|Rest]) ->
+    suffixes(MimeType, Rest);
 suffixes(MimeType,[Suffix|Rest]) ->
     [{Suffix,MimeType}|suffixes(MimeType,Rest)].
 

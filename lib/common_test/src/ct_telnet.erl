@@ -42,7 +42,8 @@
 %%                    {reconnection_interval,Millisec},
 %%                    {keep_alive,Bool},
 %%                    {poll_limit,N},
-%%                    {poll_interval,Millisec}]}.</pre>
+%%                    {poll_interval,Millisec},
+%%                    {tcp_nodelay,Bool}]}.</pre>
 %% <p><code>Millisec = integer(), N = integer()</code></p>
 %% <p>Enter the <code>telnet_settings</code> term in a configuration 
 %% file included in the test and ct_telnet will retrieve the information
@@ -182,7 +183,8 @@
 	       conn_to=?DEFAULT_TIMEOUT, 
 	       com_to=?DEFAULT_TIMEOUT, 
 	       reconns=?RECONNS,
-	       reconn_int=?RECONN_TIMEOUT}).
+	       reconn_int=?RECONN_TIMEOUT,
+	       tcp_nodelay=false}).
 
 %%%-----------------------------------------------------------------
 %%% @spec open(Name) -> {ok,Handle} | {error,Reason}
@@ -602,8 +604,18 @@ init(Name,{Ip,Port,Type},{TargetMod,KeepAlive,Extra}) ->
 	     Settings ->
 		 set_telnet_defaults(Settings,#state{})				    
 	 end,
-    case catch TargetMod:connect(Name,Ip,Port,S0#state.conn_to,
-				 KeepAlive,Extra) of
+    %% Handle old user versions of TargetMod
+    _ = code:ensure_loaded(TargetMod),
+    try
+	case erlang:function_exported(TargetMod,connect,7) of
+	    true ->
+		TargetMod:connect(Name,Ip,Port,S0#state.conn_to,
+				  KeepAlive,S0#state.tcp_nodelay,Extra);
+	    false ->
+		TargetMod:connect(Name,Ip,Port,S0#state.conn_to,
+				  KeepAlive,Extra)
+	end
+    of
 	{ok,TelnPid} ->
 	    put({ct_telnet_pid2name,TelnPid},Name),
 	    S1 = S0#state{host=Ip,
@@ -625,15 +637,18 @@ init(Name,{Ip,Port,Type},{TargetMod,KeepAlive,Extra}) ->
 		"Connection timeout: ~p\n"
 		"Keep alive: ~w\n"
 		"Poll limit: ~w\n"
-		"Poll interval: ~w",
+		"Poll interval: ~w\n"
+		"TCP nodelay: ~w",
 		[Ip,Port,S1#state.com_to,S1#state.reconns,
 		 S1#state.reconn_int,S1#state.conn_to,KeepAlive,
-		 S1#state.poll_limit,S1#state.poll_interval]),
+		 S1#state.poll_limit,S1#state.poll_interval,
+		 S1#state.tcp_nodelay]),
 	    {ok,TelnPid,S1};
-	{'EXIT',Reason} ->
-	    {error,Reason};
 	Error ->
 	    Error
+    catch
+	_:Reason ->
+	    {error,Reason}
     end.
 
 type(telnet) -> ip;
@@ -653,6 +668,8 @@ set_telnet_defaults([{poll_limit,PL}|Ss],S) ->
     set_telnet_defaults(Ss,S#state{poll_limit=PL});
 set_telnet_defaults([{poll_interval,PI}|Ss],S) ->
     set_telnet_defaults(Ss,S#state{poll_interval=PI});
+set_telnet_defaults([{tcp_nodelay,NoDelay}|Ss],S) ->
+    set_telnet_defaults(Ss,S#state{tcp_nodelay=NoDelay});
 set_telnet_defaults([Unknown|Ss],S) ->
     force_log(S,error,
 	      "Bad element in telnet_settings: ~p",[Unknown]),
@@ -671,7 +688,7 @@ handle_msg({cmd,Cmd,Opts},State) ->
     debug_cont_gen_log("Throwing Buffer:",[]),
     debug_log_lines(State#state.buffer),
 
-    case {State#state.type,State#state.prompt} of
+    _ = case {State#state.type,State#state.prompt} of
 	{ts,_} ->
 	    silent_teln_expect(State#state.name,
 			       State#state.teln_pid,
@@ -718,7 +735,7 @@ handle_msg({send,Cmd,Opts},State) ->
     debug_cont_gen_log("Throwing Buffer:",[]),
     debug_log_lines(State#state.buffer),
     
-    case {State#state.type,State#state.prompt} of
+    _ = case {State#state.type,State#state.prompt} of
 	{ts,_} -> 
 	    silent_teln_expect(State#state.name,
 			       State#state.teln_pid,
@@ -794,8 +811,17 @@ reconnect(Ip,Port,N,State=#state{name=Name,
 				 keep_alive=KeepAlive,
 				 extra=Extra,
 				 conn_to=ConnTo,
-				 reconn_int=ReconnInt}) ->
-    case TargetMod:connect(Name,Ip,Port,ConnTo,KeepAlive,Extra) of
+				 reconn_int=ReconnInt,
+				 tcp_nodelay=NoDelay}) ->
+    %% Handle old user versions of TargetMod
+    ConnResult =
+	case erlang:function_exported(TargetMod,connect,7) of
+	    true ->
+		TargetMod:connect(Name,Ip,Port,ConnTo,KeepAlive,NoDelay,Extra);
+	    false ->
+		TargetMod:connect(Name,Ip,Port,ConnTo,KeepAlive,Extra)
+	end,
+    case ConnResult of
 	{ok,NewPid} ->
 	    put({ct_telnet_pid2name,NewPid},Name),
 	    {ok, NewPid, State#state{teln_pid=NewPid}};
@@ -928,7 +954,7 @@ log(#state{name=Name,teln_pid=TelnPid,host=Host,port=Port},
 			true  ->
 			    ok;
 			false ->
-			    ct_gen_conn:cont_log(String,Args)
+			    ct_gen_conn:cont_log_no_timestamp(String,Args)
 		    end;
 	       
 	       ForcePrint == true ->
@@ -939,7 +965,7 @@ log(#state{name=Name,teln_pid=TelnPid,host=Host,port=Port},
 			    %% called
 			    ct_gen_conn:log(heading(Action,Name1),String,Args);
 			false ->
-			    ct_gen_conn:cont_log(String,Args)
+			    ct_gen_conn:cont_log_no_timestamp(String,Args)
 		    end
 	    end
     end.
@@ -1198,7 +1224,6 @@ teln_expect1(Name,Pid,Data,Pattern,Acc,EO=#eo{idle_timeout=IdleTO,
     EOMod = if TotalTO /= infinity -> EO#eo{total_timeout=trunc(TotalTO)};
 	       true                -> EO
 	    end,
-
     ExpectFun = case EOMod#eo.seq of
 		    true -> fun() ->
 				    seq_expect(Name,Pid,Data,Pattern,Acc,EOMod)
@@ -1221,38 +1246,34 @@ teln_expect1(Name,Pid,Data,Pattern,Acc,EO=#eo{idle_timeout=IdleTO,
 			    true ->
 				 IdleTO
 			 end,
+	    {PatOrPats1,Acc1,Rest1} = case NotFinished of
+					 {nomatch,Rest0} ->
+					     %% one expect
+					     {Pattern,[],Rest0};
+					 {continue,Pats0,Acc0,Rest0} ->
+					     %% sequence
+					     {Pats0,Acc0,Rest0}
+				     end,
 	    case timer:tc(ct_gen_conn, do_within_time, [Fun,BreakAfter]) of
-		{_,{error,Reason}} -> 
+		{_,{error,Reason}} ->
 		    %% A timeout will occur when the telnet connection
 		    %% is idle for EO#eo.idle_timeout milliseconds.
+		    if Rest1 /= [] ->
+			    log(name_or_pid(Name,Pid),"       ~ts",[Rest1]);
+		       true ->
+			    ok
+		    end,
 		    {error,Reason};
 		{_,{ok,Data1}} when TotalTO == infinity ->
-		    case NotFinished of
-			{nomatch,Rest} ->
-			    %% One expect
-			    teln_expect1(Name,Pid,Rest++Data1,
-					 Pattern,[],EOMod);
-			{continue,Patterns1,Acc1,Rest} ->
-			    %% Sequence
-			    teln_expect1(Name,Pid,Rest++Data1,
-					 Patterns1,Acc1,EOMod)
-		    end;
+		    teln_expect1(Name,Pid,Rest1++Data1,PatOrPats1,Acc1,EOMod);
 		{Elapsed,{ok,Data1}} ->
 		    TVal = TotalTO - (Elapsed/1000),
 		    if TVal =< 0 ->
 			    {error,timeout};
 		       true ->
 			    EO1 = EO#eo{total_timeout = TVal},
-			    case NotFinished of
-				{nomatch,Rest} ->
-				    %% One expect
-				    teln_expect1(Name,Pid,Rest++Data1,
-						 Pattern,[],EO1);
-				{continue,Patterns1,Acc1,Rest} ->
-				    %% Sequence
-				    teln_expect1(Name,Pid,Rest++Data1,
-						 Patterns1,Acc1,EO1)
-			    end
+			    teln_expect1(Name,Pid,Rest1++Data1,
+					 PatOrPats1,Acc1,EO1)
 		    end
 	    end
     end.
@@ -1390,14 +1411,14 @@ match_lines(Name,Pid,Data,Patterns,EO) ->
     case one_line(Data,[]) of
 	{noline,Rest} when FoundPrompt=/=false ->
 	    %% This is the line including the prompt
-	    case match_line(Name,Pid,Rest,Patterns,FoundPrompt,EO) of
+	    case match_line(Name,Pid,Rest,Patterns,FoundPrompt,false,EO) of
 		nomatch ->
 		    {nomatch,prompt};
 		{Tag,Match} ->
 		    {Tag,Match,[]}
 	    end;
 	{noline,Rest} when EO#eo.prompt_check==false ->
-	    case match_line(Name,Pid,Rest,Patterns,false,EO) of
+	    case match_line(Name,Pid,Rest,Patterns,false,false,EO) of
 		nomatch ->
 		    {nomatch,Rest};
 		{Tag,Match} ->
@@ -1406,7 +1427,7 @@ match_lines(Name,Pid,Data,Patterns,EO) ->
 	{noline,Rest} ->
 	    {nomatch,Rest};
 	{Line,Rest} ->
-	    case match_line(Name,Pid,Line,Patterns,false,EO) of
+	    case match_line(Name,Pid,Line,Patterns,false,true,EO) of
 		nomatch ->
 		    match_lines(Name,Pid,Rest,Patterns,EO);
 		{Tag,Match} ->
@@ -1414,45 +1435,50 @@ match_lines(Name,Pid,Data,Patterns,EO) ->
 	    end
     end.
     
-
 %% For one line, match each pattern
-match_line(Name,Pid,Line,Patterns,FoundPrompt,EO) ->
-    match_line(Name,Pid,Line,Patterns,FoundPrompt,EO,match).
+match_line(Name,Pid,Line,Patterns,FoundPrompt,Terminated,EO) ->
+    match_line(Name,Pid,Line,Patterns,FoundPrompt,Terminated,EO,match).
 
-match_line(Name,Pid,Line,[prompt|Patterns],false,EO,RetTag) ->
-    match_line(Name,Pid,Line,Patterns,false,EO,RetTag);
-match_line(Name,Pid,Line,[prompt|_Patterns],FoundPrompt,_EO,RetTag) ->
+match_line(Name,Pid,Line,[prompt|Patterns],false,Term,EO,RetTag) ->
+    match_line(Name,Pid,Line,Patterns,false,Term,EO,RetTag);
+match_line(Name,Pid,Line,[prompt|_Patterns],FoundPrompt,_Term,_EO,RetTag) ->
     log(name_or_pid(Name,Pid),"       ~ts",[Line]),
     log(name_or_pid(Name,Pid),"PROMPT: ~ts",[FoundPrompt]),
     {RetTag,{prompt,FoundPrompt}};
-match_line(Name,Pid,Line,[{prompt,PromptType}|_Patterns],FoundPrompt,_EO,RetTag) 
-  when PromptType==FoundPrompt ->
+match_line(Name,Pid,Line,[{prompt,PromptType}|_Patterns],FoundPrompt,_Term,
+	   _EO,RetTag) when PromptType==FoundPrompt ->
     log(name_or_pid(Name,Pid),"       ~ts",[Line]),
     log(name_or_pid(Name,Pid),"PROMPT: ~ts",[FoundPrompt]),
     {RetTag,{prompt,FoundPrompt}};
-match_line(Name,Pid,Line,[{prompt,PromptType}|Patterns],FoundPrompt,EO,RetTag) 
+match_line(Name,Pid,Line,[{prompt,PromptType}|Patterns],FoundPrompt,Term,
+	   EO,RetTag) 
   when PromptType=/=FoundPrompt ->
-    match_line(Name,Pid,Line,Patterns,FoundPrompt,EO,RetTag);
-match_line(Name,Pid,Line,[{Tag,Pattern}|Patterns],FoundPrompt,EO,RetTag) ->
+    match_line(Name,Pid,Line,Patterns,FoundPrompt,Term,EO,RetTag);
+match_line(Name,Pid,Line,[{Tag,Pattern}|Patterns],FoundPrompt,Term,EO,RetTag) ->
     case re:run(Line,Pattern,[{capture,all,list}]) of
 	nomatch ->
-	    match_line(Name,Pid,Line,Patterns,FoundPrompt,EO,RetTag);
+	    match_line(Name,Pid,Line,Patterns,FoundPrompt,Term,EO,RetTag);
 	{match,Match} ->
 	    log(name_or_pid(Name,Pid),"MATCH: ~ts",[Line]),
 	    {RetTag,{Tag,Match}}
     end;
-match_line(Name,Pid,Line,[Pattern|Patterns],FoundPrompt,EO,RetTag) ->
+match_line(Name,Pid,Line,[Pattern|Patterns],FoundPrompt,Term,EO,RetTag) ->
     case re:run(Line,Pattern,[{capture,all,list}]) of
 	nomatch ->
-	    match_line(Name,Pid,Line,Patterns,FoundPrompt,EO,RetTag);
+	    match_line(Name,Pid,Line,Patterns,FoundPrompt,Term,EO,RetTag);
 	{match,Match} ->
 	    log(name_or_pid(Name,Pid),"MATCH: ~ts",[Line]),
 	    {RetTag,Match}
     end;
-match_line(Name,Pid,Line,[],FoundPrompt,EO,match) ->
-    match_line(Name,Pid,Line,EO#eo.haltpatterns,FoundPrompt,EO,halt);
-match_line(Name,Pid,Line,[],_FoundPrompt,_EO,halt) ->
+match_line(Name,Pid,Line,[],FoundPrompt,Term,EO,match) ->
+    match_line(Name,Pid,Line,EO#eo.haltpatterns,FoundPrompt,Term,EO,halt);
+%% print any terminated line that can not be matched
+match_line(Name,Pid,Line,[],_FoundPrompt,true,_EO,halt) ->
     log(name_or_pid(Name,Pid),"       ~ts",[Line]),
+    nomatch;
+%% if there's no line termination, Line is saved as Rest (above) and will
+%% be printed later
+match_line(_Name,_Pid,_Line,[],_FoundPrompt,false,_EO,halt) ->
     nomatch.
 
 one_line([$\n|Rest],Line) ->
